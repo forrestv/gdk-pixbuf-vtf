@@ -25,30 +25,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <gdk-pixbuf/gdk-pixbuf-io.h>
+#include <gdk-pixbuf/gdk-pixbuf-animation.h>
 #include <glib/gstdio.h>
+
+typedef unsigned int uint;
 
 typedef struct
 {
-    char		signature[4];		// File signature ("VTF\0").
-    unsigned int	version[2];		// version[0].version[1] (currently 7.2).
-    unsigned int	headerSize;		// Size of the header struct (16 byte aligned; currently 80 bytes).
-    unsigned short	width;			// Width of the largest mipmap in pixels. Must be a power of 2.
-    unsigned short	height;			// Height of the largest mipmap in pixels. Must be a power of 2.
-    unsigned int	flags;			// VTF flags.
-    unsigned short	frames;			// Number of frames, if animated (1 for no animation).
-    unsigned short	firstFrame;		// First frame in animation (0 based).
-    unsigned char	padding0[4];		// reflectivity padding (16 byte alignment).
-    float		reflectivity[3];	// reflectivity vector.
-    unsigned char	padding1[4];		// reflectivity padding (8 byte packing).
-    float		bumpmapScale;		// Bumpmap scale.
-    unsigned int	highResImageFormat;	// High resolution image format.
-    unsigned char	mipmapCount;		// Number of mipmaps.
-    unsigned int	lowResImageFormat;	// Low resolution image format (always DXT1).
-    unsigned char	lowResImageWidth;	// Low resolution image width.
-    unsigned char	lowResImageHeight;	// Low resolution image height.
-    unsigned short	depth;			// Depth of the largest mipmap in pixels.
-    					// Must be a power of 2. Can be 0 or 1 for a 2D texture (v7.2 only).
+    char                signature[4];           // File signature ("VTF\0").
+    unsigned int        version[2];             // version[0].version[1] (currently 7.2).
+    unsigned int        headerSize;             // Size of the header struct (16 byte aligned; currently 80 bytes).
+    unsigned short      width;                  // Width of the largest mipmap in pixels. Must be a power of 2.
+    unsigned short      height;                 // Height of the largest mipmap in pixels. Must be a power of 2.
+    unsigned int        flags;                  // VTF flags.
+    unsigned short      frames;                 // Number of frames, if animated (1 for no animation).
+    unsigned short      firstFrame;             // First frame in animation (0 based).
+    unsigned char       padding0[4];            // reflectivity padding (16 byte alignment).
+    float               reflectivity[3];        // reflectivity vector.
+    unsigned char       padding1[4];            // reflectivity padding (8 byte packing).
+    float               bumpmapScale;           // Bumpmap scale.
+    unsigned int        highResImageFormat;     // High resolution image format.
+    unsigned char       mipmapCount;            // Number of mipmaps.
+    unsigned int        lowResImageFormat;      // Low resolution image format (always DXT1).
+    unsigned char       lowResImageWidth;       // Low resolution image width.
+    unsigned char       lowResImageHeight;      // Low resolution image height.
+    unsigned short      depth;                  // Depth of the largest mipmap in pixels.
+                                        // Must be a power of 2. Can be 0 or 1 for a 2D texture (v7.2 only).
 } VtfHeader;
 
 enum
@@ -124,82 +128,108 @@ gdk_pixbuf__vtf_image_begin_load (GdkPixbufModuleSizeFunc size_func,
     return (gpointer) context;
 }
 
-static gboolean
-gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
-{
-    VtfContext *context = (VtfContext *) context_ptr;
-    gboolean retval = TRUE;
+static uint
+vtf_mip_size(VtfHeader *header, uint mipLevel, uint depth) {
+    uint mipWidth  = header->width  >> mipLevel;
+    uint mipHeight = header->height >> mipLevel;
+    uint mipDepth  = depth          >> mipLevel;
 
-    
-    VtfHeader header;
-    memcpy(&header, context->buffer, sizeof(header));
-    
-    if(header.signature[0] != 'V' || header.signature[1] != 'T' || header.signature[2] != 'F' || header.signature[3] != 0) {
-    	g_set_error (
-    		error,
-    		GDK_PIXBUF_ERROR,
-    		GDK_PIXBUF_ERROR_CORRUPT_IMAGE,
-    		("File corrupt or incomplete"));
-        retval = FALSE;
-    	goto end;
+    if (mipWidth < 1) mipWidth = 1;
+    if (mipHeight < 1) mipHeight = 1;
+    if (mipDepth < 1) mipDepth = 1;
+
+    uint bytes = 0;
+    switch (header->highResImageFormat) {
+    case IMAGE_FORMAT_RGBA8888: bytes = mipWidth * mipHeight * 4; break;
+    case IMAGE_FORMAT_ABGR8888: bytes = mipWidth * mipHeight * 4; break;
+    case IMAGE_FORMAT_RGB888:   bytes = mipWidth * mipHeight * 3; break;
+    case IMAGE_FORMAT_BGR888:   bytes = mipWidth * mipHeight * 3; break;
+    case IMAGE_FORMAT_RGB565:   bytes = mipWidth * mipHeight * 2; break;
+    case IMAGE_FORMAT_I8:       bytes = mipWidth * mipHeight * 1; break;
+    case IMAGE_FORMAT_IA88:     bytes = mipWidth * mipHeight * 2; break;
+    case IMAGE_FORMAT_A8:       bytes = mipWidth * mipHeight * 1; break;
+    case IMAGE_FORMAT_DXT1:     bytes = ((mipWidth+3)/4) * ((mipHeight+3)/4) * 8; break;
+    case IMAGE_FORMAT_DXT5:     bytes = ((mipWidth+3)/4) * ((mipHeight+3)/4) * 16; break;
+    case IMAGE_FORMAT_ARGB8888: bytes = mipWidth * mipHeight * 4; break;
+    case IMAGE_FORMAT_BGRA8888: bytes = mipWidth * mipHeight * 4; break;
     }
-    
+
+    return bytes * mipDepth;
+}
+
+static uint
+vtf_offset(VtfHeader *header, uint frame, uint face, uint slice, int mipLevel)
+{
+    uint offset = 0;
+    uint facecount = 1;
+
+    for (int i = header->mipmapCount - 1; i > mipLevel; i--)
+        offset += vtf_mip_size (header, i, header->depth);
+
+    offset *= header->frames * facecount;
+
+    uint volume_bytes = vtf_mip_size (header, mipLevel, header->depth);
+    uint slice_bytes  = vtf_mip_size (header, mipLevel, 1);
+
+    offset += volume_bytes * (frame * facecount + face);
+    offset += slice_bytes  * slice;
+
+    return offset;
+}
+
+static GdkPixbuf*
+gdk_pixbuf__vtf_load_frame (VtfHeader *header, VtfContext *context, GError **error, int pos) {
     int i, j;
     GdkPixbuf* pixbuf;
-    
-    if(header.highResImageFormat == IMAGE_FORMAT_RGBA8888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+
+    if(header->highResImageFormat == IMAGE_FORMAT_RGBA8888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 4;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 4*j + 0] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 2] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_ABGR8888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_ABGR8888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 4;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 2] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 0] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_RGB888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_RGB888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 3;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 3*j + 0] = context->buffer[pos++];
                 pixels[stride*i + 3*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 3*j + 2] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_BGR888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_BGR888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 3;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 3*j + 2] = context->buffer[pos++];
                 pixels[stride*i + 3*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 3*j + 0] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_RGB565) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_RGB565) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 2;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
         	    uint16_t c0 = context->buffer[pos++];
         	    c0 |= context->buffer[pos++] << 8;
         	    
@@ -215,26 +245,24 @@ gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
                 pixels[stride*i + 3*j + 1] = g;
                 pixels[stride*i + 3*j + 2] = b;
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_I8) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_I8) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 1;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
         	    uint8_t v = context->buffer[pos++];
         	    
                 pixels[stride*i + 3*j + 0] = v;
                 pixels[stride*i + 3*j + 1] = v;
                 pixels[stride*i + 3*j + 2] = v;
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_IA88) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_IA88) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 2;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
         	    uint8_t v = context->buffer[pos++];
         	    
                 pixels[stride*i + 4*j + 0] = v;
@@ -242,25 +270,23 @@ gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
                 pixels[stride*i + 4*j + 2] = v;
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_A8) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_A8) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 1;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 4*j + 0] = 255;
                 pixels[stride*i + 4*j + 1] = 255;
                 pixels[stride*i + 4*j + 2] = 255;
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_DXT1) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_DXT1) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - ((header.width+3)/4) * ((header.height+3)/4) * 8;
-        for (i = 0; i < header.height; i+=4) {
-        	for (j = 0; j < header.width; j+=4) {
+        for (i = 0; i < header->height; i+=4) {
+        	for (j = 0; j < header->width; j+=4) {
         	    uint16_t c0 = context->buffer[pos++];
         	    c0 |= context->buffer[pos++] << 8;
         	    
@@ -325,13 +351,12 @@ gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
                     }
         	}
         }
-    } else if(header.highResImageFormat == IMAGE_FORMAT_DXT5) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_DXT5) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - ((header.width+3)/4) * ((header.height+3)/4) * 16;
-        for (i = 0; i < header.height; i+=4) {
-        	for (j = 0; j < header.width; j+=4) {
+        for (i = 0; i < header->height; i+=4) {
+        	for (j = 0; j < header->width; j+=4) {
         	    {
             	    uint16_t a[8];
             	    
@@ -415,42 +440,84 @@ gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
                 }
         	}
         }
-    } else if(header.highResImageFormat == IMAGE_FORMAT_ARGB8888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_ARGB8888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 4;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 4*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 2] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 0] = context->buffer[pos++];
         	}
-    } else if(header.highResImageFormat == IMAGE_FORMAT_BGRA8888) {
-        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header.width, header.height);
+    } else if(header->highResImageFormat == IMAGE_FORMAT_BGRA8888) {
+        pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, header->width, header->height);
         uint32_t stride = gdk_pixbuf_get_rowstride(pixbuf);
         guchar* pixels = gdk_pixbuf_get_pixels(pixbuf);
-        int pos = context->buffer_data_size - header.width * header.height * 4;
-        for (i = 0; i < header.height; i++)
-        	for (j = 0; j < header.width; j++) {
+        for (i = 0; i < header->height; i++)
+        	for (j = 0; j < header->width; j++) {
                 pixels[stride*i + 4*j + 2] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 1] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 0] = context->buffer[pos++];
                 pixels[stride*i + 4*j + 3] = context->buffer[pos++];
         	}
     } else {
-        printf("Unsupported VTF format - %i.\n", header.highResImageFormat);
+        printf("Unsupported VTF format - %i.\n", header->highResImageFormat);
     	g_set_error (
     		error,
     		GDK_PIXBUF_ERROR,
     		GDK_PIXBUF_ERROR_CORRUPT_IMAGE,
     		("Can't read this yet."));
-        retval = FALSE;
-    	goto end;
+        return NULL;
     }
-    
-    context->prepared_func(pixbuf, NULL, context->user_data);
+
+    return pixbuf;
+}
+
+
+static gboolean
+gdk_pixbuf__vtf_image_stop_load (gpointer context_ptr, GError **error)
+{
+    VtfContext *context = (VtfContext *) context_ptr;
+    gboolean retval = TRUE;
+
+
+    VtfHeader header;
+    memcpy(&header, context->buffer, sizeof(header));
+
+    if(header.signature[0] != 'V' || header.signature[1] != 'T' || header.signature[2] != 'F' || header.signature[3] != 0 || header.frames == 0) {
+        g_set_error (
+            error,
+            GDK_PIXBUF_ERROR,
+            GDK_PIXBUF_ERROR_CORRUPT_IMAGE,
+            ("File corrupt or incomplete"));
+        retval = FALSE;
+        goto end;
+    }
+
+    if (header.version[0] * 256 + header.version[1] < 0x0702)
+        header.depth = 1;
+
+    uint fulldata = vtf_offset(&header, 0, 0, 0, -1);
+    uint base = context->buffer_data_size - fulldata;
+
+    GdkPixbufSimpleAnim *anim = gdk_pixbuf_simple_anim_new(header.width, header.height, 8);
+    gdk_pixbuf_simple_anim_set_loop(anim, TRUE);
+
+    for (int i=0; i < header.frames; i++) {
+        GdkPixbuf *pixbuf = gdk_pixbuf__vtf_load_frame(&header, context, error,
+            base + vtf_offset(&header, i, 0, 0, 0));
+        if (!pixbuf) {
+            g_object_unref(anim);
+            goto end;
+        }
+
+        gdk_pixbuf_simple_anim_add_frame(anim, pixbuf);
+
+        if (i == 0)
+            context->prepared_func(pixbuf, GDK_PIXBUF_ANIMATION(anim), context->user_data);
+    }
 
 end:
     g_free(context->buffer);
