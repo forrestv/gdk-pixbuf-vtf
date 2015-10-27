@@ -1,18 +1,24 @@
-CC = gcc
-CFLAGS=-Wall -std=c99
+CC=gcc
+CFLAGS=-Wall -Wextra -Werror -std=gnu99
+BIN=libpixbufloader-vtf.so
+DESTDIR=`pkg-config gdk-pixbuf-2.0 --variable=gdk_pixbuf_moduledir`
 
-DESTDIR=
+all: $(BIN)
 
-all:
-	$(CC) $(CFLAGS) io-vtf.c  -o libpixbufloader-vtf.so \
+$(BIN): io-vtf.c
+	$(CC) $(CFLAGS) $< -o $@ \
 		`pkg-config --cflags gtk+-2.0` \
 		-shared -fpic -DGDK_PIXBUF_ENABLE_BACKEND -O3
 
 clean:
-	rm libpixbufloader-vtf.so
+	rm $(BIN)
 
-install:
-	chmod 644 libpixbufloader-vtf.so
-	mkdir -p $(DESTDIR)/usr/lib/gtk-2.0/2.10.0/loaders/
-	cp libpixbufloader-vtf.so $(DESTDIR)/usr/lib/gtk-2.0/2.10.0/loaders/
+install: $(BIN) x-vtf.xml
+	mkdir -p $(DESTDIR)
+	install -t $(DESTDIR) $(BIN)
+	gdk-pixbuf-query-loaders --update-cache
 
+uninstall:
+	rm $(DESTDIR)/$(BIN)
+
+.PHONY: all clean install uninstall
