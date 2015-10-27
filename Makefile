@@ -7,7 +7,7 @@ all: $(BIN)
 
 $(BIN): io-vtf.c
 	$(CC) $(CFLAGS) $< -o $@ \
-		`pkg-config --cflags gtk+-2.0` \
+		`pkg-config --cflags --libs gtk+-2.0` -lm \
 		-shared -fpic -DGDK_PIXBUF_ENABLE_BACKEND -O3
 
 clean:
